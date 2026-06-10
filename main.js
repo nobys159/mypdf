@@ -176,13 +176,21 @@ ipcMain.handle('sign-pdf', async (_event, pdfPath, pfxPath, passphrase) => {
 // List available certificates in CurrentUser\My that have private keys
 ipcMain.handle('list-windows-certs', async () => {
   try {
-    const ps = `Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey } | Select-Object Thumbprint, Subject, NotAfter, FriendlyName | ConvertTo-Json`;
-    const res = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8' });
-    if (res.status !== 0) throw new Error(res.stderr || 'PowerShell error');
+    const winPs = path.join(process.env.windir || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const ps = `Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey } | Select-Object Thumbprint, Subject, NotAfter, FriendlyName | ConvertTo-Json -Depth 2`;
+    const res = spawnSync(winPs, ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8' });
+    if (res.error) throw res.error;
+    if (res.status !== 0) {
+      // Provide clearer message when Cert: provider is unavailable
+      const stderr = res.stderr || res.stdout || '';
+      if (/DriveNotFoundException|Cannot find drive/i.test(stderr)) {
+        throw new Error('PowerShell Cert: drive not found. Ensure Windows PowerShell is available on this system.');
+      }
+      throw new Error(stderr || 'PowerShell error');
+    }
     const out = res.stdout.trim();
     if (!out) return [];
     const parsed = JSON.parse(out);
-    // Normalize to array
     return Array.isArray(parsed) ? parsed : [parsed];
   } catch (err) {
     return { error: err.message || String(err) };
@@ -231,9 +239,12 @@ $signedCms.ComputeSignature($cmsSigner)
 "`;
     fs.writeFileSync(psPath, psScript, { encoding: 'utf8' });
 
-    const psExec = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psPath, dataPath, thumbprint, sigPath], { encoding: 'utf8' });
+    const winPs = path.join(process.env.windir || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const psExec = spawnSync(winPs, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psPath, dataPath, thumbprint, sigPath], { encoding: 'utf8' });
+    if (psExec.error) throw psExec.error;
     if (psExec.status !== 0) {
-      throw new Error(psExec.stderr || 'PowerShell signing failed');
+      const stderr = psExec.stderr || psExec.stdout || '';
+      throw new Error(stderr || 'PowerShell signing failed');
     }
 
     const signature = fs.readFileSync(sigPath);
