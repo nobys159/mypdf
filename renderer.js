@@ -56,6 +56,11 @@ const ui = {
   status: document.getElementById('status'),
   signMarkedBtn: document.getElementById('signMarkedBtn'),
   clearSignatureBtn: document.getElementById('clearSignatureBtn'),
+  selectPfxBtn: document.getElementById('selectPfxBtn'),
+  pfxPathSpan: document.getElementById('pfxPath'),
+  pfxPassInput: document.getElementById('pfxPass'),
+  signPdfBtn: document.getElementById('signPdfBtn'),
+  signedResult: document.getElementById('signedResult'),
   closeOrganizerBtn: document.getElementById('closeOrganizerBtn'),
   openOrganizerRibbon: document.getElementById('openOrganizerRibbon'),
   closeSignatureBtn: document.getElementById('closeSignatureBtn'),
@@ -928,6 +933,51 @@ ui.closeSignatureBtn.addEventListener('click', () => {
 
 ui.openSignatureRibbon.addEventListener('click', () => {
   setPaneOpen(signaturePane, ui.openSignatureRibbon, true);
+});
+
+// PFX selection and signing actions
+let selectedPfxPath = null;
+
+ui.selectPfxBtn.addEventListener('click', async () => {
+  const pfx = await ipcRenderer.invoke('select-pfx');
+  if (pfx) {
+    selectedPfxPath = pfx;
+    ui.pfxPathSpan.textContent = pfx;
+    setStatus('PFX selected');
+  }
+});
+
+ui.signPdfBtn.addEventListener('click', async () => {
+  if (!state.filePath) {
+    const choose = await ipcRenderer.invoke('show-open-dialog');
+    if (!choose) return;
+    await loadPdf(choose);
+  }
+  if (!selectedPfxPath) {
+    setStatus('Select a PFX first');
+    return;
+  }
+  const pass = ui.pfxPassInput.value || '';
+  setStatus('Signing PDF...');
+  ui.signPdfBtn.disabled = true;
+  try {
+    const res = await ipcRenderer.invoke('sign-pdf', state.filePath, selectedPfxPath, pass);
+    if (res && res.success) {
+      ui.signedResult.innerHTML = `Signed file: <a href="#" id="signedLink">${res.path}</a>`;
+      const signedLink = document.getElementById('signedLink');
+      signedLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        require('electron').shell.openPath(res.path);
+      });
+      setStatus('Signing succeeded');
+    } else {
+      setStatus('Signing failed: ' + (res && res.error ? res.error : 'unknown'));
+    }
+  } catch (err) {
+    setStatus('Signing error: ' + err.message);
+  } finally {
+    ui.signPdfBtn.disabled = false;
+  }
 });
 
 signatureCanvas.addEventListener('pointerdown', startSignatureStroke);

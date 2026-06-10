@@ -46,6 +46,18 @@
           <button id="signMarkedBtn" title="Stamp the drawn signature into PDF signature fields">Sign Marked Areas</button>
           <button id="clearSignatureBtn">Clear Pad</button>
         </div>
+        <div class="pfxControls">
+          <div>
+            <button id="selectPfxBtn">Select PFX/P12</button>
+            <span id="pfxPath" style="margin-left:8px;">No certificate selected</span>
+          </div>
+          <div style="margin-top:8px;">
+            <label for="pfxPass">PFX passphrase:</label>
+            <input id="pfxPass" type="password" style="margin-left:8px; width:220px;" />
+            <button id="signPdfBtn" style="margin-left:8px;">Sign PDF</button>
+          </div>
+          <div id="signedResult" style="margin-top:8px;"></div>
+        </div>
         <div id="status">Open a PDF to begin</div>
       </aside>
     </div>

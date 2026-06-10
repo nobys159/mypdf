@@ -2,6 +2,9 @@ const { app, BrowserWindow, dialog, ipcMain, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const signer = require('node-signpdf').default;
+const { plainAddPlaceholder } = require('node-signpdf/dist/helpers');
+const { spawnSync } = require('child_process');
 
 const debugLogPath = path.join(os.tmpdir(), 'mypdf-argv.log');
 
@@ -139,4 +142,127 @@ ipcMain.handle('show-save-dialog', async (_event, defaultPath) => {
   });
   if (canceled) return null;
   return filePath;
+});
+
+ipcMain.handle('select-pfx', async () => {
+  const { canceled, filePaths } = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    filters: [{ name: 'PFX', extensions: ['p12', 'pfx'] }]
+  });
+  if (canceled) return null;
+  return filePaths[0];
+});
+
+ipcMain.handle('sign-pdf', async (_event, pdfPath, pfxPath, passphrase) => {
+  try {
+    if (!pdfPath || !pfxPath) throw new Error('Missing pdf or pfx path');
+    const pdfBuffer = fs.readFileSync(pdfPath);
+    const p12Buffer = fs.readFileSync(pfxPath);
+
+    // Add a placeholder for the signature
+    const pdfWithPlaceholder = plainAddPlaceholder({ pdfBuffer, reason: 'Signed by mypdf', signatureLength: 8192 });
+
+    // Sign the PDF
+    const signedPdf = signer.sign(pdfWithPlaceholder, p12Buffer, { passphrase: passphrase || '' });
+
+    const outPath = pdfPath.replace(/\.pdf$/i, '-signed.pdf');
+    fs.writeFileSync(outPath, signedPdf);
+    return { success: true, path: outPath };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
+
+// List available certificates in CurrentUser\My that have private keys
+ipcMain.handle('list-windows-certs', async () => {
+  try {
+    const ps = `Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey } | Select-Object Thumbprint, Subject, NotAfter, FriendlyName | ConvertTo-Json`;
+    const res = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8' });
+    if (res.status !== 0) throw new Error(res.stderr || 'PowerShell error');
+    const out = res.stdout.trim();
+    if (!out) return [];
+    const parsed = JSON.parse(out);
+    // Normalize to array
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch (err) {
+    return { error: err.message || String(err) };
+  }
+});
+
+// Sign PDF using a certificate thumbprint from the Windows store (CurrentUser\My)
+ipcMain.handle('sign-pdf-with-thumbprint', async (_event, pdfPath, thumbprint) => {
+  try {
+    if (!pdfPath || !thumbprint) throw new Error('Missing pdfPath or thumbprint');
+
+    const pdfBuffer = fs.readFileSync(pdfPath);
+
+    // Add placeholder
+    const pdfWithPlaceholder = plainAddPlaceholder({ pdfBuffer, reason: 'Signed by mypdf', signatureLength: 16384 });
+
+    // Read ByteRange from the PDF
+    const pdfStr = pdfWithPlaceholder.toString('binary');
+    const byteRangeMatch = /\/ByteRange \[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]/.exec(pdfStr);
+    if (!byteRangeMatch) throw new Error('ByteRange not found');
+    const ranges = byteRangeMatch.slice(1).map((v) => parseInt(v, 10));
+    const [a, b, c, d] = ranges;
+
+    // Build the data that needs to be signed (concatenate the two ranges)
+    const part1 = pdfWithPlaceholder.slice(a, a + b);
+    const part2 = pdfWithPlaceholder.slice(c, c + d);
+    const dataToSign = Buffer.concat([part1, part2]);
+
+    // Write dataToSign to temp file and prepare output sig file
+    const tmp = os.tmpdir();
+    const dataPath = path.join(tmp, `mypdf-data-${Date.now()}.bin`);
+    const sigPath = path.join(tmp, `mypdf-sig-${Date.now()}.bin`);
+    const psPath = path.join(tmp, `mypdf-sign-${Date.now()}.ps1`);
+    fs.writeFileSync(dataPath, dataToSign);
+
+    // PowerShell script to compute SignedCms (detached) using cert thumbprint
+    const psScript = `Param($dataPath, $thumbprint, $outPath)
+$bytes = [System.IO.File]::ReadAllBytes($dataPath)
+$cert = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Thumbprint -eq $thumbprint } | Select-Object -First 1
+if ($null -eq $cert) { Write-Error "Certificate not found"; exit 2 }
+$contentInfo = New-Object System.Security.Cryptography.Pkcs.ContentInfo -ArgumentList (,@($bytes))
+$signedCms = New-Object System.Security.Cryptography.Pkcs.SignedCms -ArgumentList $contentInfo, $false
+$cmsSigner = New-Object System.Security.Cryptography.Pkcs.CmsSigner $cert
+$signedCms.ComputeSignature($cmsSigner)
+[System.IO.File]::WriteAllBytes($outPath, $signedCms.Encode())
+"`;
+    fs.writeFileSync(psPath, psScript, { encoding: 'utf8' });
+
+    const psExec = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psPath, dataPath, thumbprint, sigPath], { encoding: 'utf8' });
+    if (psExec.status !== 0) {
+      throw new Error(psExec.stderr || 'PowerShell signing failed');
+    }
+
+    const signature = fs.readFileSync(sigPath);
+
+    // Replace placeholder in PDF (/Contents <...>) with the PKCS#7 signature (hex) padded
+    const contentsTag = '/Contents <';
+    const idx = pdfWithPlaceholder.indexOf(contentsTag);
+    if (idx === -1) throw new Error('/Contents tag not found');
+    const start = pdfWithPlaceholder.indexOf('<', idx) + 1;
+    const end = pdfWithPlaceholder.indexOf('>', start);
+    if (start === -1 || end === -1) throw new Error('Malformed Contents placeholder');
+    const placeholderLen = end - start;
+    const sigHex = signature.toString('hex');
+    if (sigHex.length > placeholderLen) throw new Error('Signature too large for placeholder');
+    const padded = sigHex + '0'.repeat(placeholderLen - sigHex.length);
+
+    // Create final PDF buffer
+    const before = pdfWithPlaceholder.slice(0, start);
+    const after = pdfWithPlaceholder.slice(end);
+    const finalPdf = Buffer.concat([Buffer.from(before, 'binary'), Buffer.from(padded, 'ascii'), Buffer.from(after, 'binary')]);
+
+    const outPath = pdfPath.replace(/\.pdf$/i, '-signed.pdf');
+    fs.writeFileSync(outPath, finalPdf);
+
+    // Clean up temp files
+    try { fs.unlinkSync(dataPath); fs.unlinkSync(sigPath); fs.unlinkSync(psPath); } catch (e) {}
+
+    return { success: true, path: outPath };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
 });
