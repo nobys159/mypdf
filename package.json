@@ -1,6 +1,6 @@
 {
   "name": "pdfium-proto",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cross-platform PDF app prototype using Electron + PDF.js",
   "main": "main.js",
   "scripts": {
@@ -32,14 +32,17 @@
     ],
     "win": {
       "target": [
-        "nsis",
-        "portable"
+        "nsis"
       ],
       "artifactName": "${productName}-setup-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,
-      "perMachine": false
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "runAfterFinish": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
     }
     ,"fileAssociations": [
       {
