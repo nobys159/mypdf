@@ -48,13 +48,14 @@
         </div>
         <div class="pfxControls">
           <div>
-            <button id="selectPfxBtn">Select PFX/P12</button>
-            <span id="pfxPath" style="margin-left:8px;">No certificate selected</span>
+            <label for="certificateSelect">Certificate:</label>
+            <select id="certificateSelect" style="min-width:360px; margin-left:8px;"></select>
+            <button id="refreshCertsBtn" style="margin-left:8px;">Refresh</button>
           </div>
           <div style="margin-top:8px;">
-            <label for="pfxPass">PFX passphrase:</label>
-            <input id="pfxPass" type="password" style="margin-left:8px; width:220px;" />
-            <button id="signPdfBtn" style="margin-left:8px;">Sign PDF</button>
+            <label for="pfxPass">(Optional) PFX passphrase:</label>
+            <input id="pfxPass" type="password" style="margin-left:8px; width:220px; margin-left:8px;" />
+            <button id="signWithCertBtn" style="margin-left:8px;">Sign with Cert</button>
           </div>
           <div id="signedResult" style="margin-top:8px;"></div>
         </div>

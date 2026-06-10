@@ -61,6 +61,9 @@ const ui = {
   pfxPassInput: document.getElementById('pfxPass'),
   signPdfBtn: document.getElementById('signPdfBtn'),
   signedResult: document.getElementById('signedResult'),
+  certificateSelect: document.getElementById('certificateSelect'),
+  refreshCertsBtn: document.getElementById('refreshCertsBtn'),
+  signWithCertBtn: document.getElementById('signWithCertBtn'),
   closeOrganizerBtn: document.getElementById('closeOrganizerBtn'),
   openOrganizerRibbon: document.getElementById('openOrganizerRibbon'),
   closeSignatureBtn: document.getElementById('closeSignatureBtn'),
@@ -935,33 +938,54 @@ ui.openSignatureRibbon.addEventListener('click', () => {
   setPaneOpen(signaturePane, ui.openSignatureRibbon, true);
 });
 
-// PFX selection and signing actions
-let selectedPfxPath = null;
-
-ui.selectPfxBtn.addEventListener('click', async () => {
-  const pfx = await ipcRenderer.invoke('select-pfx');
-  if (pfx) {
-    selectedPfxPath = pfx;
-    ui.pfxPathSpan.textContent = pfx;
-    setStatus('PFX selected');
+// Certificate store listing and signing actions
+async function refreshCerts() {
+  ui.certificateSelect.innerHTML = '';
+  ui.certificateSelect.disabled = true;
+  ui.refreshCertsBtn.disabled = true;
+  setStatus('Loading certificates...');
+  try {
+    const res = await ipcRenderer.invoke('list-windows-certs');
+    ui.refreshCertsBtn.disabled = false;
+    ui.certificateSelect.disabled = false;
+    if (!res) { setStatus('No certificates found'); return; }
+    if (res.error) { setStatus('Error: ' + res.error); return; }
+    const certs = Array.isArray(res) ? res : [res];
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = 'Select a certificate...';
+    ui.certificateSelect.appendChild(placeholder);
+    certs.forEach((c) => {
+      const text = `${c.Subject} (thumb: ${c.Thumbprint})`;
+      const opt = document.createElement('option');
+      opt.value = c.Thumbprint;
+      opt.textContent = text;
+      ui.certificateSelect.appendChild(opt);
+    });
+    setStatus(`Found ${certs.length} certificate(s)`);
+  } catch (err) {
+    ui.refreshCertsBtn.disabled = false;
+    ui.certificateSelect.disabled = false;
+    setStatus('Error listing certs: ' + (err.message || err));
   }
-});
+}
 
-ui.signPdfBtn.addEventListener('click', async () => {
+ui.refreshCertsBtn.addEventListener('click', refreshCerts);
+// load certs immediately
+refreshCerts();
+
+ui.signWithCertBtn.addEventListener('click', async () => {
   if (!state.filePath) {
     const choose = await ipcRenderer.invoke('show-open-dialog');
     if (!choose) return;
     await loadPdf(choose);
   }
-  if (!selectedPfxPath) {
-    setStatus('Select a PFX first');
-    return;
-  }
-  const pass = ui.pfxPassInput.value || '';
-  setStatus('Signing PDF...');
-  ui.signPdfBtn.disabled = true;
+  const thumb = ui.certificateSelect.value;
+  if (!thumb) { setStatus('Select a certificate'); return; }
+  setStatus('Signing with certificate...');
+  ui.signWithCertBtn.disabled = true;
   try {
-    const res = await ipcRenderer.invoke('sign-pdf', state.filePath, selectedPfxPath, pass);
+    const res = await ipcRenderer.invoke('sign-pdf-with-thumbprint', state.filePath, thumb);
     if (res && res.success) {
       ui.signedResult.innerHTML = `Signed file: <a href="#" id="signedLink">${res.path}</a>`;
       const signedLink = document.getElementById('signedLink');
@@ -976,7 +1000,7 @@ ui.signPdfBtn.addEventListener('click', async () => {
   } catch (err) {
     setStatus('Signing error: ' + err.message);
   } finally {
-    ui.signPdfBtn.disabled = false;
+    ui.signWithCertBtn.disabled = false;
   }
 });
 
