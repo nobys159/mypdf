@@ -24,6 +24,15 @@ const state = {
   pages: new Map()
 };
 
+ipcRenderer.on('open-file', async (_event, filePath) => {
+  if (!filePath) return;
+  try {
+    await loadPdf(filePath);
+  } catch (e) {
+    setStatus(`Failed to open file: ${e.message}`);
+  }
+});
+
 const viewerPane = document.getElementById('viewerPane');
 const viewerContainer = document.getElementById('viewerContainer');
 const thumbList = document.getElementById('thumbList');

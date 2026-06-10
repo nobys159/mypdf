@@ -4,7 +4,8 @@
   "description": "Cross-platform PDF app prototype using Electron + PDF.js",
   "main": "main.js",
   "scripts": {
-    "start": "node start.js"
+    "start": "node start.js",
+    "dist": "electron-builder --win --x64"
   },
   "keywords": [
     "pdf",
@@ -19,6 +20,34 @@
     "tesseract.js": "^4.1.1"
   },
   "devDependencies": {
-    "electron": "^26.0.0"
+    "electron": "^26.0.0",
+    "electron-builder": "^26.15.2"
+  },
+  "build": {
+    "appId": "com.nobys.mypdf",
+    "productName": "mypdf",
+    "files": [
+      "**/*",
+      "!node_modules/*/.bin"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "artifactName": "${productName}-setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false
+    }
+    ,"fileAssociations": [
+      {
+        "ext": "pdf",
+        "name": "PDF Document",
+        "description": "PDF file",
+        "role": "Viewer"
+      }
+    ]
   }
 }
