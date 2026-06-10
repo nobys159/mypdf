@@ -1,0 +1,24 @@
+{
+  "name": "pdfium-proto",
+  "version": "0.1.0",
+  "description": "Cross-platform PDF app prototype using Electron + PDF.js",
+  "main": "main.js",
+  "scripts": {
+    "start": "node start.js"
+  },
+  "keywords": [
+    "pdf",
+    "electron",
+    "pdfjs"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^3.10.753",
+    "tesseract.js": "^4.1.1"
+  },
+  "devDependencies": {
+    "electron": "^26.0.0"
+  }
+}

@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PDF App Prototype</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="toolbar">
+      <button id="openBtn">Open PDF</button>
+      <button id="prevBtn">Prev</button>
+      <button id="nextBtn">Next</button>
+      <span id="pageInfo">Page - / -</span>
+      <button id="zoomIn">Zoom +</button>
+      <button id="zoomOut">Zoom -</button>
+      <button id="placeBtn">Place Signature</button>
+      <button id="clearLastBtn">Undo</button>
+      <button id="clearAllBtn">Clear</button>
+      <button id="saveBtn">Save PDF</button>
+      <button id="printBtn">Print</button>
+      <input id="fileInput" type="file" accept="application/pdf" style="display:none" />
+    </div>
+
+    <div id="workspace">
+      <aside id="organizerPane">
+        <div class="panelHeader">
+          <div class="panelTitle">Pages</div>
+          <button id="closeOrganizerBtn" class="paneCloseBtn" type="button" title="Close pages panel">x</button>
+        </div>
+        <div id="thumbList"></div>
+      </aside>
+      <button id="openOrganizerRibbon" class="sideRibbon leftRibbon" type="button" title="Show pages panel" hidden>Pages</button>
+      <div id="viewerPane">
+        <div id="viewerContainer"></div>
+      </div>
+      <button id="openSignatureRibbon" class="sideRibbon rightRibbon" type="button" title="Show signature panel" hidden>Signature</button>
+      <aside id="signaturePane">
+        <div class="panelHeader">
+          <div class="panelTitle">Signature</div>
+          <button id="closeSignatureBtn" class="paneCloseBtn" type="button" title="Close signature panel">x</button>
+        </div>
+        <canvas id="signaturePad" width="320" height="160"></canvas>
+        <div class="panelActions">
+          <button id="signMarkedBtn" title="Stamp the drawn signature into PDF signature fields">Sign Marked Areas</button>
+          <button id="clearSignatureBtn">Clear Pad</button>
+        </div>
+        <div id="status">Open a PDF to begin</div>
+      </aside>
+    </div>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>
