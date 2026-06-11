@@ -7,6 +7,7 @@ require('pdfjs-dist/legacy/build/pdf.worker.entry.js');
 const { PDFDocument, degrees } = require('pdf-lib');
 
 const pdfjsBasePath = pathToFileURL(path.join(__dirname, 'node_modules', 'pdfjs-dist')).href + '/';
+const SIGNATURE_DETAILS_KEYWORD_PREFIX = 'mypdf-signature-details:';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pathToFileURL(
   require.resolve('pdfjs-dist/legacy/build/pdf.worker.js')
@@ -21,7 +22,14 @@ const state = {
   placeMode: false,
   placements: [],
   pageOrder: [],
-  pages: new Map()
+  pages: new Map(),
+  // map pageId -> array of signature annotation objects {rect, annotation, id}
+  signatureFields: new Map(),
+  showSignaturePlaceholders: true,
+  signedPath: null,
+  signerFieldContext: null,
+  signedSignatureDetails: [],
+  hasDigitalSignature: false
 };
 
 ipcRenderer.on('open-file', async (_event, filePath) => {
@@ -56,14 +64,17 @@ const ui = {
   status: document.getElementById('status'),
   signMarkedBtn: document.getElementById('signMarkedBtn'),
   clearSignatureBtn: document.getElementById('clearSignatureBtn'),
-  selectPfxBtn: document.getElementById('selectPfxBtn'),
-  pfxPathSpan: document.getElementById('pfxPath'),
-  pfxPassInput: document.getElementById('pfxPass'),
-  signPdfBtn: document.getElementById('signPdfBtn'),
+  signerModal: document.getElementById('signerModal'),
+  closeSignerModalBtn: document.getElementById('closeSignerModalBtn'),
+  signerFieldInfo: document.getElementById('signerFieldInfo'),
   signedResult: document.getElementById('signedResult'),
+  signatureDetailsModal: document.getElementById('signatureDetailsModal'),
+  closeSignatureDetailsBtn: document.getElementById('closeSignatureDetailsBtn'),
+  signatureDetailsBody: document.getElementById('signatureDetailsBody'),
   certificateSelect: document.getElementById('certificateSelect'),
   refreshCertsBtn: document.getElementById('refreshCertsBtn'),
   signWithCertBtn: document.getElementById('signWithCertBtn'),
+  openSignedFileBtn: document.getElementById('openSignedFileBtn'),
   closeOrganizerBtn: document.getElementById('closeOrganizerBtn'),
   openOrganizerRibbon: document.getElementById('openOrganizerRibbon'),
   closeSignatureBtn: document.getElementById('closeSignatureBtn'),
@@ -120,15 +131,20 @@ function updateButtons() {
   ui.zoomOutBtn.disabled = !hasPdf;
   ui.zoomInBtn.disabled = !hasPdf;
   ui.placeBtn.disabled = !hasPdf || !signatureHasInk;
-  ui.signMarkedBtn.disabled = !hasPdf || !signatureHasInk;
+  ui.signMarkedBtn.disabled = !hasPdf;
   ui.clearLastBtn.disabled = !hasPdf || state.placements.length === 0;
   ui.clearAllBtn.disabled = !hasPdf || state.placements.length === 0;
-  ui.saveBtn.disabled = !hasPdf;
+  ui.saveBtn.disabled = !hasPdf || state.hasDigitalSignature;
+  ui.saveBtn.title = state.hasDigitalSignature
+    ? 'Signed PDFs must not be rewritten. Use the signed output file.'
+    : 'Save PDF';
   ui.placeBtn.classList.toggle('active', state.placeMode);
 
   for (const pageView of state.pages.values()) {
-    pageView.overlayCanvas.style.pointerEvents = state.placeMode ? 'auto' : 'none';
-    pageView.overlayCanvas.style.cursor = state.placeMode ? 'crosshair' : 'default';
+    const hasFields = (state.signatureFields.get(pageView.entry.id) || []).length > 0;
+    const hasSignedDetails = state.signedSignatureDetails.some((item) => item.pageId === pageView.entry.id);
+    pageView.overlayCanvas.style.pointerEvents = state.placeMode || hasFields || hasSignedDetails ? 'auto' : 'none';
+    pageView.overlayCanvas.style.cursor = state.placeMode ? 'crosshair' : hasFields || hasSignedDetails ? 'pointer' : 'default';
   }
 
   for (const item of thumbList.querySelectorAll('.thumbItem')) {
@@ -159,8 +175,15 @@ function closeCurrentPdf() {
   state.placeMode = false;
   state.placements = [];
   state.pageOrder = [];
+  state.signatureFields.clear();
+  state.signedPath = null;
+  state.signerFieldContext = null;
+  state.signedSignatureDetails = [];
+  state.hasDigitalSignature = false;
   clearViewer();
   thumbList.replaceChildren();
+  if (ui.signedResult) ui.signedResult.textContent = '';
+  if (ui.openSignedFileBtn) ui.openSignedFileBtn.disabled = true;
   setStatus('Open a PDF to begin');
   updatePageInfo();
   updateButtons();
@@ -192,13 +215,31 @@ function createPageView(entry, width, height, viewport) {
   overlayCanvas.style.width = `${width}px`;
   overlayCanvas.style.height = `${height}px`;
   overlayCanvas.style.pointerEvents = state.placeMode ? 'auto' : 'none';
+  overlayCanvas.style.cursor = state.placeMode ? 'crosshair' : 'default';
 
   overlayCanvas.addEventListener('pointerdown', async (event) => {
-    if (!state.placeMode || !state.pdfDoc) return;
-    event.preventDefault();
-    await addPlacement(entry.id, event.offsetX, event.offsetY);
-    state.placeMode = false;
-    updateButtons();
+    if (state.placeMode && state.pdfDoc) {
+      event.preventDefault();
+      await addPlacement(entry.id, event.offsetX, event.offsetY);
+      state.placeMode = false;
+      updateButtons();
+      return;
+    }
+
+    // If not in placement mode, clicking on a placeholder should trigger interactive signing
+    if (!state.pdfDoc) return;
+    try {
+      if (await handleSignedSignatureClick(entry.id, event.offsetX, event.offsetY)) {
+        event.preventDefault();
+        return;
+      }
+      const handled = await handlePlaceholderClick(entry.id, event.offsetX, event.offsetY);
+      if (handled) {
+        event.preventDefault();
+      }
+    } catch (err) {
+      console.error('Placeholder click handler error', err);
+    }
   });
 
   shell.append(canvas, svgLayer, overlayCanvas);
@@ -283,11 +324,413 @@ function placementToScreen(placement, pageView) {
   };
 }
 
+function pointInRect(x, y, rx, ry, rw, rh) {
+  return x >= rx && x <= rx + rw && y >= ry && y <= ry + rh;
+}
+
+function getSignatureFieldCount() {
+  let count = 0;
+  for (const fields of state.signatureFields.values()) {
+    count += fields.length;
+  }
+  return count;
+}
+
+function setSignerResult(message, linkPath = null) {
+  if (!ui.signedResult) return;
+  ui.signedResult.textContent = message || '';
+  state.signedPath = linkPath;
+  if (ui.openSignedFileBtn) ui.openSignedFileBtn.disabled = !linkPath;
+}
+
+function getCommonNameFromSubject(subject) {
+  if (!subject) return 'Unknown';
+  const match = /(?:^|,\s*)CN=([^,]+)/i.exec(subject);
+  return match ? match[1].trim() : subject.split(',')[0].trim();
+}
+
+function inferSignatureType(subject) {
+  if (!subject) return 'Unknown';
+  if (/(?:^|,\s*)O=/i.test(subject) || /OID\.2\.5\.4\.10=/i.test(subject)) {
+    return 'Organizational';
+  }
+  return 'Individual';
+}
+
+function normalizeKeywords(keywords) {
+  if (!keywords) return [];
+  if (Array.isArray(keywords)) return keywords.filter(Boolean);
+  return String(keywords)
+    .split(/[;,\s]+/)
+    .map((keyword) => keyword.trim())
+    .filter(Boolean);
+}
+
+function encodeSignatureDetails(details) {
+  return `${SIGNATURE_DETAILS_KEYWORD_PREFIX}${Buffer.from(JSON.stringify(details), 'utf8').toString('base64')}`;
+}
+
+function decodeSignatureDetailsKeywords(keywords) {
+  const details = [];
+  const text = normalizeKeywords(keywords).join(' ');
+  const regex = new RegExp(`${SIGNATURE_DETAILS_KEYWORD_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([A-Za-z0-9+/=]+)`, 'g');
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(Buffer.from(match[1], 'base64').toString('utf8'));
+      if (parsed && Number.isInteger(parsed.pageIndex) && parsed.displayRect) {
+        details.push(parsed);
+      }
+    } catch (error) {
+      console.warn('Failed to parse stored signature details', error);
+    }
+  }
+  return details;
+}
+
+function hasEmbeddedDigitalSignature(pdfBytes) {
+  if (!pdfBytes || pdfBytes.length === 0) return false;
+  const text = Buffer.from(pdfBytes).toString('latin1');
+  return /\/Type\s*\/Sig\b/.test(text)
+    && /\/ByteRange\s*\[\s*\d+\s+\d+\s+\d+\s+\d+\s*\]/.test(text)
+    && /\/Contents\s*<[\s0-9A-Fa-f]+>/.test(text);
+}
+
+async function readStoredSignatureDetails(pdfBytes) {
+  try {
+    const pdfDoc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+    return decodeSignatureDetailsKeywords(pdfDoc.getKeywords());
+  } catch (error) {
+    console.warn('Failed to read stored signature details', error);
+    return [];
+  }
+}
+
+function mapStoredSignatureDetails(storedDetails) {
+  return storedDetails
+    .map((details) => {
+      const entry = state.pageOrder[details.pageIndex];
+      if (!entry) return null;
+      return {
+        ...details,
+        pageId: entry.id,
+        signatureType: details.signatureType || inferSignatureType(details.subject),
+        signerName: details.signerName || getCommonNameFromSubject(details.subject),
+        signedAt: details.signedAt ? new Date(details.signedAt).toLocaleString() : ''
+      };
+    })
+    .filter(Boolean);
+}
+
+function getSignatureDetailKeywordsForExport() {
+  const details = [];
+  for (const detail of state.signedSignatureDetails) {
+    const outputPageIndex = state.pageOrder.findIndex((entry) => entry.id === detail.pageId);
+    if (outputPageIndex < 0) continue;
+    const { pageId, ...storedDetail } = detail;
+    details.push({
+      ...storedDetail,
+      pageIndex: outputPageIndex
+    });
+  }
+  return details.map(encodeSignatureDetails);
+}
+
+function expandSignatureRect(rect, pageSize) {
+  const pageWidth = pageSize.width;
+  const pageHeight = pageSize.height;
+  const targetWidth = Math.min(Math.max(rect.width * 1.45, 170), pageWidth - 24);
+  const targetHeight = Math.min(Math.max(rect.height * 2.25, 58), pageHeight - 24);
+  const centerX = rect.x + rect.width / 2;
+  const centerY = rect.y + rect.height / 2;
+  let x = centerX - targetWidth / 2;
+  let y = centerY - targetHeight / 2;
+
+  x = Math.min(Math.max(12, x), pageWidth - targetWidth - 12);
+  y = Math.min(Math.max(12, y), pageHeight - targetHeight - 12);
+
+  return { x, y, width: targetWidth, height: targetHeight };
+}
+
+function pdfRectToScreen(rect, pageView) {
+  const pts = [
+    pageView.viewport.convertToViewportPoint(rect.x, rect.y + rect.height),
+    pageView.viewport.convertToViewportPoint(rect.x + rect.width, rect.y),
+    pageView.viewport.convertToViewportPoint(rect.x, rect.y),
+    pageView.viewport.convertToViewportPoint(rect.x + rect.width, rect.y + rect.height)
+  ];
+  const xs = pts.map((p) => p[0]);
+  const ys = pts.map((p) => p[1]);
+  const minX = Math.min(...xs);
+  const minY = Math.min(...ys);
+  return {
+    x: minX,
+    y: minY,
+    w: Math.max(...xs) - minX,
+    h: Math.max(...ys) - minY
+  };
+}
+
+function setDetailsRow(label, value) {
+  const row = document.createElement('div');
+  row.className = 'detailsRow';
+  const labelEl = document.createElement('div');
+  labelEl.className = 'detailsLabel';
+  labelEl.textContent = label;
+  const valueEl = document.createElement('div');
+  valueEl.className = 'detailsValue';
+  valueEl.textContent = value || '-';
+  row.append(labelEl, valueEl);
+  ui.signatureDetailsBody.appendChild(row);
+}
+
+function formatVerificationStatus(verification) {
+  if (!verification) return 'Checking...';
+  if (!verification.success) return `Verification failed: ${verification.error || 'Unknown error'}`;
+  if (!verification.integrityValid) return `Invalid: ${verification.error || 'signature check failed'}`;
+  if (verification.expectedThumbprint && !verification.thumbprintMatches) {
+    return 'Invalid: signer certificate does not match stored signature details';
+  }
+  return verification.trusted
+    ? 'Authentic and trusted'
+    : 'Authentic, but certificate trust could not be fully validated';
+}
+
+function showSignatureDetails(details, verification = null) {
+  ui.signatureDetailsBody.replaceChildren();
+  setDetailsRow('Status', 'Signed');
+  setDetailsRow('Verification', formatVerificationStatus(verification));
+  setDetailsRow('Sign type', details.signatureType);
+  setDetailsRow('Signer', details.signerName);
+  setDetailsRow('Signed on', details.signedAt);
+  setDetailsRow('Field', details.label);
+  setDetailsRow('Certificate', details.subject);
+  setDetailsRow('Issuer', details.issuer);
+  setDetailsRow('Thumbprint', details.thumbprint);
+  setDetailsRow('Store', details.store);
+  if (verification?.error && verification.integrityValid) {
+    setDetailsRow('Trust note', verification.error);
+  }
+  ui.signatureDetailsModal.hidden = false;
+}
+
+async function verifyAndShowSignatureDetails(details) {
+  showSignatureDetails(details);
+  try {
+    const verification = await ipcRenderer.invoke('verify-pdf-signature', state.filePath, details.thumbprint);
+    showSignatureDetails(details, verification);
+  } catch (error) {
+    showSignatureDetails(details, {
+      success: false,
+      integrityValid: false,
+      trusted: false,
+      error: error.message || String(error)
+    });
+  }
+}
+
+async function handleSignedSignatureClick(pageId, screenX, screenY) {
+  const pageView = state.pages.get(pageId);
+  if (!pageView) return false;
+  const details = state.signedSignatureDetails.filter((item) => item.pageId === pageId);
+  for (const item of details) {
+    const screenRect = pdfRectToScreen(item.displayRect, pageView);
+    if (pointInRect(screenX, screenY, screenRect.x, screenRect.y, screenRect.w, screenRect.h)) {
+      await verifyAndShowSignatureDetails(item);
+      return true;
+    }
+  }
+  return false;
+}
+
+async function openSignerUtility(fieldLabel = null, fieldContext = null) {
+  if (!state.pdfDoc) {
+    setStatus('Open a PDF first');
+    return;
+  }
+
+  state.signerFieldContext = fieldContext;
+  const fieldCount = getSignatureFieldCount();
+  const fieldText = fieldLabel
+    ? `Ready to sign field: ${fieldLabel}`
+    : fieldCount > 0
+      ? `Detected ${fieldCount} signature field${fieldCount === 1 ? '' : 's'} in this PDF.`
+      : 'No signature fields were detected. The signer can still apply a document-level digital signature.';
+
+  ui.signerFieldInfo.textContent = fieldText;
+  ui.signerModal.hidden = false;
+  setSignerResult('');
+
+  if (ui.certificateSelect.options.length <= 1) {
+    await refreshCerts();
+  }
+
+  ui.certificateSelect.focus();
+}
+
+async function handlePlaceholderClick(pageId, screenX, screenY) {
+  const pageView = state.pages.get(pageId);
+  if (!pageView) return false;
+  const fields = state.signatureFields.get(pageId) || [];
+  for (let i = 0; i < fields.length; i += 1) {
+    const fld = fields[i];
+    const pts = [
+      pageView.viewport.convertToViewportPoint(fld.rect.x, fld.rect.y + fld.rect.height),
+      pageView.viewport.convertToViewportPoint(fld.rect.x + fld.rect.width, fld.rect.y),
+      pageView.viewport.convertToViewportPoint(fld.rect.x, fld.rect.y),
+      pageView.viewport.convertToViewportPoint(fld.rect.x + fld.rect.width, fld.rect.y + fld.rect.height)
+    ];
+    const xs = pts.map((p) => p[0]);
+    const ys = pts.map((p) => p[1]);
+    const minX = Math.min(...xs);
+    const minY = Math.min(...ys);
+    const w = Math.max(...xs) - minX;
+    const h = Math.max(...ys) - minY;
+    if (pointInRect(screenX, screenY, minX, minY, w, h)) {
+      const label = fld.annotation && fld.annotation.fieldName ? fld.annotation.fieldName : `Signature ${i + 1}`;
+      // Try to show embedded signature details if present in the PDF
+      try {
+        if (state.filePath) {
+          const details = await ipcRenderer.invoke('get-all-signature-details', state.filePath);
+          if (details && !details.error && Array.isArray(details) && details.length > 0) {
+            showSignatureDetailsModal(details);
+            return true;
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to fetch signature details', err);
+      }
+
+      await openSignerUtility(label, {
+        label,
+        pageIndex: pageView.entry.sourcePageNum - 1,
+        rect: { ...fld.rect }
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+function showSignatureDetailsModal(details) {
+  const existing = document.getElementById('sigDetailsModal');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'sigDetailsModal';
+  overlay.style.position = 'fixed';
+  overlay.style.left = '0';
+  overlay.style.top = '0';
+  overlay.style.right = '0';
+  overlay.style.bottom = '0';
+  overlay.style.background = 'rgba(0,0,0,0.45)';
+  overlay.style.zIndex = '9999';
+  overlay.style.display = 'flex';
+  overlay.style.alignItems = 'center';
+  overlay.style.justifyContent = 'center';
+
+  const box = document.createElement('div');
+  box.style.background = '#fff';
+  box.style.borderRadius = '8px';
+  box.style.padding = '16px';
+  box.style.width = '720px';
+  box.style.maxHeight = '80vh';
+  box.style.overflow = 'auto';
+  box.style.boxShadow = '0 8px 24px rgba(0,0,0,0.25)';
+
+  const title = document.createElement('h3');
+  title.textContent = 'Signature Details';
+  box.appendChild(title);
+
+  details.forEach((d, idx) => {
+    const section = document.createElement('div');
+    section.style.padding = '8px 0';
+    if (idx > 0) section.style.borderTop = '1px solid #eee';
+
+    const header = document.createElement('div');
+    header.style.fontWeight = '600';
+    header.style.marginBottom = '6px';
+    header.textContent = `Signature ${idx + 1}`;
+    section.appendChild(header);
+
+    const kv = [
+      ['Thumbprint', d.Thumbprint || d.thumbprint || ''],
+      ['Subject', d.Subject || d.subject || ''],
+      ['Issuer', d.Issuer || d.issuer || ''],
+      ['Serial', d.SerialNumber || d.serialNumber || ''],
+      ['Signed On', d.SignedOn || d.signedOn || ''],
+      ['Error', d.Error || d.error || '']
+    ];
+
+    kv.forEach(([k, v]) => {
+      const row = document.createElement('div');
+      row.style.margin = '2px 0';
+      row.innerHTML = `<strong>${k}:</strong> ${v || '<i>n/a</i>'}`;
+      section.appendChild(row);
+    });
+
+    box.appendChild(section);
+  });
+
+  const close = document.createElement('button');
+  close.textContent = 'Close';
+  close.style.marginTop = '10px';
+  close.addEventListener('click', () => overlay.remove());
+  box.appendChild(close);
+
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+}
+
 async function redrawOverlay(pageId) {
   const pageView = state.pages.get(pageId);
   if (!pageView) return;
 
   clearCanvas(pageView.overlayCtx, pageView.overlayCanvas);
+
+  // draw signature placeholders (if any)
+  if (state.showSignaturePlaceholders) {
+    const fields = state.signatureFields.get(pageId) || [];
+    for (let i = 0; i < fields.length; i += 1) {
+      const fld = fields[i];
+      // convert pdf rect to screen coordinates
+      const pts = [
+        pageView.viewport.convertToViewportPoint(fld.rect.x, fld.rect.y + fld.rect.height),
+        pageView.viewport.convertToViewportPoint(fld.rect.x + fld.rect.width, fld.rect.y),
+        pageView.viewport.convertToViewportPoint(fld.rect.x, fld.rect.y),
+        pageView.viewport.convertToViewportPoint(fld.rect.x + fld.rect.width, fld.rect.y + fld.rect.height)
+      ];
+      const xs = pts.map((p) => p[0]);
+      const ys = pts.map((p) => p[1]);
+      const minX = Math.min(...xs);
+      const minY = Math.min(...ys);
+      const w = Math.max(...xs) - minX;
+      const h = Math.max(...ys) - minY;
+
+      pageView.overlayCtx.save();
+      pageView.overlayCtx.strokeStyle = 'rgba(220,20,60,0.95)';
+      pageView.overlayCtx.lineWidth = Math.max(2, Math.min(4, Math.max(1, Math.min(w, h) * 0.03)));
+      pageView.overlayCtx.setLineDash([6, 4]);
+      pageView.overlayCtx.strokeRect(minX, minY, w, h);
+
+      // draw identification text above the rect (or inside if space)
+      const label = fld.annotation && fld.annotation.fieldName ? fld.annotation.fieldName : `Signature ${i + 1}`;
+      const fontSize = Math.max(10, Math.min(16, Math.floor(Math.min(14, w * 0.08))));
+      pageView.overlayCtx.font = `${fontSize}px sans-serif`;
+      pageView.overlayCtx.fillStyle = 'rgba(220,20,60,0.95)';
+      const textWidth = pageView.overlayCtx.measureText(label).width;
+      const textX = minX + 4;
+      const textY = minY - 6;
+      if (textY > fontSize + 2) {
+        pageView.overlayCtx.fillText(label, textX, textY - 2);
+      } else {
+        // place inside the rect if not enough space above
+        pageView.overlayCtx.fillText(label, textX, minY + fontSize + 2);
+      }
+      pageView.overlayCtx.restore();
+    }
+  }
+
   const currentPlacements = state.placements.filter((placement) => placement.pageId === pageId);
   for (const placement of currentPlacements) {
     const image = await loadImage(placement.src);
@@ -346,6 +789,9 @@ async function renderDocument() {
       if (token !== renderToken) return;
     }
     renderOrganizer();
+    // detect and store signature placeholders, then redraw overlays to show them
+    await populateSignatureFields();
+    await redrawAllOverlays();
     updatePageInfo();
     updateButtons();
     updateCurrentPageFromScroll();
@@ -494,6 +940,7 @@ async function loadPdf(filePath) {
   const bytes = fs.readFileSync(filePath);
   state.filePath = filePath;
   state.pdfBytes = bytes;
+  state.hasDigitalSignature = hasEmbeddedDigitalSignature(bytes);
   try {
     if (!pdfWorker) {
       pdfWorker = new pdfjsLib.PDFWorker({ name: 'pdf-viewer' });
@@ -514,11 +961,17 @@ async function loadPdf(filePath) {
     state.pageNum = 1;
     state.placements = [];
     state.placeMode = false;
+    state.signatureFields.clear();
+    state.signedPath = null;
+    state.signerFieldContext = null;
+    state.signedSignatureDetails = [];
+    setSignerResult('');
     state.pageOrder = Array.from({ length: state.pdfDoc.numPages }, (_value, index) => ({
       id: `page-${index + 1}-${Date.now()}`,
       sourcePageNum: index + 1,
       rotation: 0
     }));
+    state.signedSignatureDetails = mapStoredSignatureDetails(await readStoredSignatureDetails(bytes));
     setStatus(`Loaded ${path.basename(filePath)}`);
     updateButtons();
     updatePageInfo();
@@ -528,6 +981,11 @@ async function loadPdf(filePath) {
     state.pageOrder = [];
     state.placements = [];
     state.placeMode = false;
+    state.signatureFields.clear();
+    state.signedPath = null;
+    state.signerFieldContext = null;
+    state.signedSignatureDetails = [];
+    setSignerResult('');
     clearViewer();
     thumbList.replaceChildren();
     setStatus(`Failed to load PDF: ${error.message}`);
@@ -655,11 +1113,26 @@ async function findSignatureFields() {
       if (!isSignatureAnnotation(annotation)) continue;
       const rect = normalizePdfRect(annotation.rect);
       if (!rect || rect.width < 4 || rect.height < 4) continue;
-      fields.push({ entry, rect });
+      fields.push({ entry, rect, annotation });
     }
   }
 
   return fields;
+}
+
+async function populateSignatureFields() {
+  state.signatureFields.clear();
+  try {
+    const fields = await findSignatureFields();
+    for (const f of fields) {
+      const pageId = f.entry.id;
+      const arr = state.signatureFields.get(pageId) || [];
+      arr.push({ rect: f.rect, annotation: f.annotation });
+      state.signatureFields.set(pageId, arr);
+    }
+  } catch (err) {
+    console.warn('Failed to populate signature fields:', err);
+  }
 }
 
 async function signMarkedAreas() {
@@ -765,6 +1238,10 @@ async function addPlacement(pageId, screenX, screenY) {
 
 async function exportSignedPdf() {
   if (!state.pdfBytes || state.pageOrder.length === 0) return;
+  if (state.hasDigitalSignature) {
+    setStatus('Signed PDFs cannot be rewritten without invalidating the digital certificate.');
+    return;
+  }
 
   const outputPath = await ipcRenderer.invoke('show-save-dialog', getSuggestedSavePath());
   if (!outputPath) return;
@@ -794,6 +1271,10 @@ async function exportSignedPdf() {
       });
     }
   }
+
+  const existingKeywords = normalizeKeywords(sourcePdf.getKeywords())
+    .filter((keyword) => !keyword.startsWith(SIGNATURE_DETAILS_KEYWORD_PREFIX));
+  outputPdf.setKeywords([...existingKeywords, ...getSignatureDetailKeywordsForExport()]);
 
   const outputBytes = await outputPdf.save();
   fs.writeFileSync(outputPath, Buffer.from(outputBytes));
@@ -912,7 +1393,9 @@ ui.saveBtn.addEventListener('click', exportSignedPdf);
 
 ui.printBtn.addEventListener('click', () => window.print());
 
-ui.signMarkedBtn.addEventListener('click', signMarkedAreas);
+ui.signMarkedBtn.addEventListener('click', () => {
+  openSignerUtility();
+});
 
 ui.clearSignatureBtn.addEventListener('click', () => {
   signatureCtx.clearRect(0, 0, signatureCanvas.width, signatureCanvas.height);
@@ -938,27 +1421,69 @@ ui.openSignatureRibbon.addEventListener('click', () => {
   setPaneOpen(signaturePane, ui.openSignatureRibbon, true);
 });
 
+ui.closeSignerModalBtn.addEventListener('click', () => {
+  ui.signerModal.hidden = true;
+});
+
+ui.signerModal.addEventListener('pointerdown', (event) => {
+  if (event.target === ui.signerModal) {
+    ui.signerModal.hidden = true;
+  }
+});
+
+ui.closeSignatureDetailsBtn.addEventListener('click', () => {
+  ui.signatureDetailsModal.hidden = true;
+});
+
+ui.signatureDetailsModal.addEventListener('pointerdown', (event) => {
+  if (event.target === ui.signatureDetailsModal) {
+    ui.signatureDetailsModal.hidden = true;
+  }
+});
+
 // Certificate store listing and signing actions
 async function refreshCerts() {
   ui.certificateSelect.innerHTML = '';
   ui.certificateSelect.disabled = true;
   ui.refreshCertsBtn.disabled = true;
+  setSignerResult('');
   setStatus('Loading certificates...');
   try {
     const res = await ipcRenderer.invoke('list-windows-certs');
     ui.refreshCertsBtn.disabled = false;
     ui.certificateSelect.disabled = false;
-    if (!res) { setStatus('No certificates found'); return; }
-    if (res.error) { setStatus('Error: ' + res.error); return; }
+    if (!res) {
+      setSignerResult('No signing certificates found in Windows personal certificate stores.');
+      setStatus('No certificates found');
+      return;
+    }
+    if (res.error) {
+      setSignerResult('Certificate listing error: ' + res.error);
+      setStatus('Error: ' + res.error);
+      return;
+    }
     const certs = Array.isArray(res) ? res : [res];
     const placeholder = document.createElement('option');
     placeholder.value = '';
-    placeholder.textContent = 'Select a certificate...';
+    placeholder.textContent = certs.length > 0 ? 'Select a certificate...' : 'No signing certificates found';
     ui.certificateSelect.appendChild(placeholder);
+    if (certs.length === 0) {
+      ui.certificateSelect.disabled = true;
+      setSignerResult('No certificates with private keys were found in CurrentUser or LocalMachine personal stores.');
+      setStatus('No certificates found');
+      return;
+    }
     certs.forEach((c) => {
-      const text = `${c.Subject} (thumb: ${c.Thumbprint})`;
+      const store = c.Store || 'CurrentUser';
+      const friendly = c.FriendlyName ? `${c.FriendlyName} - ` : '';
+      const text = `${friendly}${c.Subject} [${store}]`;
       const opt = document.createElement('option');
-      opt.value = c.Thumbprint;
+      opt.value = `${store}|${c.Thumbprint}`;
+      opt.title = `Thumbprint: ${c.Thumbprint}`;
+      opt.dataset.subject = c.Subject || '';
+      opt.dataset.issuer = c.Issuer || '';
+      opt.dataset.store = store;
+      opt.dataset.thumbprint = c.Thumbprint || '';
       opt.textContent = text;
       ui.certificateSelect.appendChild(opt);
     });
@@ -966,7 +1491,9 @@ async function refreshCerts() {
   } catch (err) {
     ui.refreshCertsBtn.disabled = false;
     ui.certificateSelect.disabled = false;
-    setStatus('Error listing certs: ' + (err.message || err));
+    const message = err.message || String(err);
+    setSignerResult('Certificate listing error: ' + message);
+    setStatus('Error listing certs: ' + message);
   }
 }
 
@@ -983,25 +1510,73 @@ ui.signWithCertBtn.addEventListener('click', async () => {
   const thumb = ui.certificateSelect.value;
   if (!thumb) { setStatus('Select a certificate'); return; }
   setStatus('Signing with certificate...');
+  setSignerResult('Signing...');
   ui.signWithCertBtn.disabled = true;
   try {
-    const res = await ipcRenderer.invoke('sign-pdf-with-thumbprint', state.filePath, thumb);
+    const selectedOption = ui.certificateSelect.selectedOptions[0];
+    const selectedSubject = selectedOption?.dataset.subject || selectedOption?.textContent || '';
+    const signedAtIso = new Date().toISOString();
+    const signatureType = inferSignatureType(selectedSubject);
+    const appearance = state.signerFieldContext
+      ? {
+          ...state.signerFieldContext,
+          subject: selectedSubject,
+          issuer: selectedOption?.dataset.issuer || '',
+          thumbprint: selectedOption?.dataset.thumbprint || '',
+          store: selectedOption?.dataset.store || '',
+          signerName: getCommonNameFromSubject(selectedSubject),
+          signedAt: signedAtIso,
+          signatureType
+        }
+      : null;
+    const res = await ipcRenderer.invoke('sign-pdf-with-thumbprint', state.filePath, thumb, appearance);
     if (res && res.success) {
-      ui.signedResult.innerHTML = `Signed file: <a href="#" id="signedLink">${res.path}</a>`;
-      const signedLink = document.getElementById('signedLink');
-      signedLink.addEventListener('click', (e) => {
-        e.preventDefault();
-        require('electron').shell.openPath(res.path);
-      });
+      const signedContext = state.signerFieldContext;
+      const pageId = signedContext ? state.pageOrder[signedContext.pageIndex]?.id : null;
+      const signedDetails = signedContext && pageId
+        ? {
+            pageId,
+            label: signedContext.label,
+            rect: signedContext.rect,
+            displayRect: expandSignatureRect(signedContext.rect, state.pages.get(pageId)?.pageSize || { width: 612, height: 792 }),
+            signerName: getCommonNameFromSubject(selectedSubject),
+            subject: selectedSubject,
+            issuer: selectedOption?.dataset.issuer || '',
+            thumbprint: selectedOption?.dataset.thumbprint || '',
+            store: selectedOption?.dataset.store || '',
+            signedAt: new Date(signedAtIso).toLocaleString(),
+            signatureType
+          }
+        : null;
+      setSignerResult(`Signed file: ${res.path}`, res.path);
+      await loadPdf(res.path);
+      if (signedDetails) {
+        const newEntry = state.pageOrder[signedContext.pageIndex];
+        signedDetails.pageId = newEntry?.id || signedDetails.pageId;
+        state.signedSignatureDetails = [signedDetails];
+        await redrawAllOverlays();
+        updateButtons();
+      }
+      ui.signerModal.hidden = false;
+      setSignerResult(`Signed file: ${res.path}`, res.path);
       setStatus('Signing succeeded');
     } else {
-      setStatus('Signing failed: ' + (res && res.error ? res.error : 'unknown'));
+      const message = res && res.error ? res.error : 'unknown';
+      setSignerResult(`Signing failed: ${message}`);
+      setStatus('Signing failed: ' + message);
     }
   } catch (err) {
-    setStatus('Signing error: ' + err.message);
+    const message = err.message || String(err);
+    setSignerResult(`Signing error: ${message}`);
+    setStatus('Signing error: ' + message);
   } finally {
     ui.signWithCertBtn.disabled = false;
   }
+});
+
+ui.openSignedFileBtn.addEventListener('click', () => {
+  if (!state.signedPath) return;
+  require('electron').shell.openPath(state.signedPath);
 });
 
 signatureCanvas.addEventListener('pointerdown', startSignatureStroke);
@@ -1012,6 +1587,16 @@ signatureCanvas.addEventListener('pointerleave', endSignatureStroke);
 viewerPane.addEventListener('scroll', updateCurrentPageFromScroll);
 
 window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !ui.signatureDetailsModal.hidden) {
+    ui.signatureDetailsModal.hidden = true;
+    return;
+  }
+
+  if (event.key === 'Escape' && !ui.signerModal.hidden) {
+    ui.signerModal.hidden = true;
+    return;
+  }
+
   if (event.key === 'Escape' && state.placeMode) {
     state.placeMode = false;
     updateButtons();
@@ -1047,3 +1632,9 @@ window.addEventListener('resize', resizeSignaturePad);
 updatePageInfo();
 updateButtons();
 setStatus('Open a PDF to begin');
+// Ensure signature panel is collapsed on startup
+try {
+  setPaneOpen(signaturePane, ui.openSignatureRibbon, false);
+} catch (e) {
+  console.warn('Could not set signature pane state on startup', e);
+}
